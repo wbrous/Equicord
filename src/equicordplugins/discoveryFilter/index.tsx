@@ -80,19 +80,12 @@ const WrappedFilterCheckboxes = ErrorBoundary.wrap(FilterCheckboxes, {
     noop: true,
 });
 
-let restoreGetItemKey: (() => void) | null = null;
-let masonryModuleListener: ((exports: any, id: any) => void) | null = null;
+let masonryCleanup: (() => void) | null = null;
+let masonryListener: ((exports: any) => void) | null = null;
 
-function isGuildResult(item: any): boolean {
-    return item && typeof item.id === "string" && (
-        Array.isArray(item.features) ||
-        (item.features && typeof item.features.has === "function")
-    );
-}
-
-function tryPatchMasonry(exports: any): boolean {
+function tryPatchMasonry(exports: any): (() => void) | null {
     const MasonryListComputer = exports?.default || exports?.MasonryListComputer;
-    if (!MasonryListComputer?.prototype?.getItemKey) return false;
+    if (!MasonryListComputer?.prototype?.getItemKey) return null;
 
     const proto = MasonryListComputer.prototype;
     const original = proto.getItemKey;
@@ -102,44 +95,46 @@ function tryPatchMasonry(exports: any): boolean {
         if (key == null) return key;
 
         const item = section?.items?.[index];
-        if (!isGuildResult(item)) return key;
+        if (!item || typeof item.id !== "string") return key;
+        const hasFeatures = Array.isArray(item.features) || (item.features && typeof item.features.has === "function");
+        if (!hasFeatures) return key;
 
         return filterGuild(item) ? key : null;
     };
 
-    restoreGetItemKey = () => {
-        proto.getItemKey = original;
-    };
-
-    return true;
+    return () => { proto.getItemKey = original; };
 }
 
 function patchMasonryListComputer() {
     for (const key in cache) {
         const mod = cache[key];
         if (!mod?.loaded || mod.exports == null) continue;
-        if (tryPatchMasonry(mod.exports)) return;
+        const up = tryPatchMasonry(mod.exports);
+        if (up) { masonryCleanup = up; return; }
         for (const nestedKey in mod.exports) {
-            if (tryPatchMasonry(mod.exports[nestedKey])) return;
+            const up2 = tryPatchMasonry(mod.exports[nestedKey]);
+            if (up2) { masonryCleanup = up2; return; }
         }
     }
 
-    masonryModuleListener = (exports: any) => {
-        if (tryPatchMasonry(exports)) {
-            moduleListeners.delete(masonryModuleListener!);
-            masonryModuleListener = null;
+    masonryListener = (exports: any) => {
+        const up = tryPatchMasonry(exports);
+        if (up) {
+            masonryCleanup = up;
+            moduleListeners.delete(masonryListener!);
+            masonryListener = null;
         }
     };
-    moduleListeners.add(masonryModuleListener);
+    moduleListeners.add(masonryListener);
 }
 
 function unpatchMasonryListComputer() {
-    if (masonryModuleListener) {
-        moduleListeners.delete(masonryModuleListener);
-        masonryModuleListener = null;
+    if (masonryListener) {
+        moduleListeners.delete(masonryListener);
+        masonryListener = null;
     }
-    restoreGetItemKey?.();
-    restoreGetItemKey = null;
+    masonryCleanup?.();
+    masonryCleanup = null;
 }
 
 export default definePlugin({
