@@ -10,13 +10,11 @@ import { definePluginSettings } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
 import { EquicordDevs } from "@utils/constants";
 import { classNameFactory } from "@utils/css";
-import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
-import { findStore } from "@webpack";
+import { cache, findStore, moduleListeners } from "@webpack";
 import { Checkbox } from "@webpack/common";
 
 const cl = classNameFactory("vc-discovery-filter-");
-const logger = new Logger("DiscoveryFilter");
 
 const settings = definePluginSettings({
     showOnlyPartnered: {
@@ -31,38 +29,46 @@ const settings = definePluginSettings({
     },
 });
 
-function hasFeature(guild: any, feature: string): boolean {
-    const { features } = guild;
-    if (Array.isArray(features)) return features.includes(feature);
-    return features?.has?.(feature) ?? false;
-}
-
-function filterGuild(guild: any): boolean {
+function filterGuild(guild: any) {
+    if (!guild) return true;
     const { showOnlyPartnered, showOnlyVerified } = settings.store;
     if (!showOnlyPartnered && !showOnlyVerified) return true;
 
-    if (showOnlyPartnered && showOnlyVerified) {
-        return hasFeature(guild, "PARTNERED") && hasFeature(guild, "VERIFIED");
-    }
-    if (showOnlyPartnered) return hasFeature(guild, "PARTNERED");
-    if (showOnlyVerified) return hasFeature(guild, "VERIFIED");
+    const has = (f: string) =>
+        Array.isArray(guild.features)
+            ? guild.features.includes(f)
+            : (guild.features?.has?.(f) ?? false);
+
+    if (showOnlyPartnered && showOnlyVerified)
+        return has("PARTNERED") && has("VERIFIED");
+    if (showOnlyPartnered) return has("PARTNERED");
+    if (showOnlyVerified) return has("VERIFIED");
     return true;
 }
 
+function updateFilter(key: string, value: boolean) {
+    settings.store[key] = value;
+    const store = findStore("GlobalDiscoveryServersSearchResultsStore");
+    (store as any)?.emitChange?.();
+}
+
 function FilterCheckboxes() {
-    const { showOnlyPartnered, showOnlyVerified } = settings.use(["showOnlyPartnered", "showOnlyVerified"]);
+    const { showOnlyPartnered, showOnlyVerified } = settings.use([
+        "showOnlyPartnered",
+        "showOnlyVerified",
+    ]);
 
     return (
         <div className={cl("container")}>
             <Checkbox
                 value={showOnlyPartnered}
-                onChange={(_, v) => settings.store.showOnlyPartnered = v}
+                onChange={(_, v) => updateFilter("showOnlyPartnered", v)}
             >
                 Partnered Only
             </Checkbox>
             <Checkbox
                 value={showOnlyVerified}
-                onChange={(_, v) => settings.store.showOnlyVerified = v}
+                onChange={(_, v) => updateFilter("showOnlyVerified", v)}
             >
                 Verified Only
             </Checkbox>
@@ -70,52 +76,105 @@ function FilterCheckboxes() {
     );
 }
 
-const WrappedFilterCheckboxes = ErrorBoundary.wrap(FilterCheckboxes, { noop: true });
+const WrappedFilterCheckboxes = ErrorBoundary.wrap(FilterCheckboxes, {
+    noop: true,
+});
 
-let originalGetGuildIds: Function;
+let restoreGetItemKey: (() => void) | null = null;
+let masonryModuleListener: ((exports: any, id: any) => void) | null = null;
+
+function isGuildResult(item: any): boolean {
+    return item && typeof item.id === "string" && (
+        Array.isArray(item.features) ||
+        (item.features && typeof item.features.has === "function")
+    );
+}
+
+function tryPatchMasonry(exports: any): boolean {
+    const MasonryListComputer = exports?.default || exports?.MasonryListComputer;
+    if (!MasonryListComputer?.prototype?.getItemKey) return false;
+
+    const proto = MasonryListComputer.prototype;
+    const original = proto.getItemKey;
+
+    proto.getItemKey = function (section: any, index: number) {
+        const key = original.call(this, section, index);
+        if (key == null) return key;
+
+        const item = section?.items?.[index];
+        if (!isGuildResult(item)) return key;
+
+        return filterGuild(item) ? key : null;
+    };
+
+    restoreGetItemKey = () => {
+        proto.getItemKey = original;
+    };
+
+    return true;
+}
+
+function patchMasonryListComputer() {
+    for (const key in cache) {
+        const mod = cache[key];
+        if (!mod?.loaded || mod.exports == null) continue;
+        if (tryPatchMasonry(mod.exports)) return;
+        for (const nestedKey in mod.exports) {
+            if (tryPatchMasonry(mod.exports[nestedKey])) return;
+        }
+    }
+
+    masonryModuleListener = (exports: any) => {
+        if (tryPatchMasonry(exports)) {
+            moduleListeners.delete(masonryModuleListener!);
+            masonryModuleListener = null;
+        }
+    };
+    moduleListeners.add(masonryModuleListener);
+}
+
+function unpatchMasonryListComputer() {
+    if (masonryModuleListener) {
+        moduleListeners.delete(masonryModuleListener);
+        masonryModuleListener = null;
+    }
+    restoreGetItemKey?.();
+    restoreGetItemKey = null;
+}
 
 export default definePlugin({
     name: "DiscoveryFilter",
     description: "Filter discovery servers by partnered or verified status.",
-    tags: ["Discovery", "Servers"],
+    tags: ["Customisation", "Servers"],
     authors: [EquicordDevs.Gir0fa],
     settings,
 
-    start() {
-        const store = findStore("GlobalDiscoveryServersSearchResultsStore") as any;
-        if (!store?.getGuildIds) {
-            logger.error("Could not find GlobalDiscoveryServersSearchResultsStore");
-            return;
-        }
-
-        originalGetGuildIds = store.getGuildIds.bind(store);
-        store.getGuildIds = function (e: any) {
-            const ids = originalGetGuildIds(e);
-            if (!ids) return ids;
-            return ids.filter((id: string) => {
-                const guild = store.getGuild(id);
-                if (!guild) return true;
-                return filterGuild(guild);
-            });
-        };
-    },
-
-    stop() {
-        const store = findStore("GlobalDiscoveryServersSearchResultsStore") as any;
-        if (originalGetGuildIds && store) {
-            store.getGuildIds = originalGetGuildIds;
-        }
-    },
+    filterGuild,
 
     FilterCheckboxes: WrappedFilterCheckboxes,
 
+    start() {
+        patchMasonryListComputer();
+    },
+
+    stop() {
+        unpatchMasonryListComputer();
+    },
+
     patches: [
         {
-            find: "chunkSize:24",
+            find: "GlobalDiscoveryServersSearchResultsStore",
             replacement: {
-                match: /(return \(0,\i\.jsx\)\("div",\{className:\i\.\i,children:)\(0,\i\.jsx\)\(\i\.\i,\{selectionMode:"single"/,
-                replace: "$1[$self.FilterCheckboxes(),$2"
-            }
-        }
-    ]
+                match: /(?<=getGuildIds\(\i\)\{return )\i\(\i,\i=>\i\.guildIds\)/,
+                replace: "$&?.filter(id=>$self.filterGuild(this.getGuild(id)))",
+            },
+        },
+        {
+            find: "GLOBAL_DISCOVERY_SIDEBAR},",
+            replacement: {
+                match: /GLOBAL_DISCOVERY_TABS\.map\(\i=>\(0,\i\.jsx\)\(\i,\{tab:\i\},\i\)\)\}\)(?=\])/,
+                replace: "$&,$self.FilterCheckboxes()",
+            },
+        },
+    ],
 });
